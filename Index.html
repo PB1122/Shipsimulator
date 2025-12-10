@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="utf-8">
+    <title>Båtsimulator med Dynamisk Rök</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js"></script>
+    <link href="https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css" rel="stylesheet"/>
+    <style>
+        body { margin:0; overflow:hidden; font-family:sans-serif; }
+        #map { position:absolute; top:0; bottom:0; width:100%; }
+        #controls {
+            position:absolute; top:0; left:0; width:220px; height:100%;
+            overflow-y:auto; background:rgba(255,255,255,0.95);
+            padding:15px; box-sizing:border-box; display:flex; flex-direction:column;
+            justify-content:flex-start; z-index:10;
+        }
+        .control-section { margin-bottom:20px; border-bottom:1px solid #ccc; padding-bottom:10px; }
+        .section-title { font-weight:bold; margin-bottom:5px; }
+        input[type=number], input[type=time] { width:70px; margin-bottom:5px; }
+        button { margin:2px 0; width:100%; font-size:14px; padding:5px 0; }
+        #isabella {
+            position:absolute; background:url('cruiseship.png') no-repeat center center;
+            background-size:contain; transform-origin:center center; pointer-events:none;
+            z-index:10; width:150px; height:150px;
+        }
+        #speedDisplay {
+            position:absolute; top:10px; right:10px; z-index:10;
+            background:rgba(255,255,255,0.7); padding:10px; border-radius:8px; font-size:18px;
+        }
+        #wakeCanvas {
+            position:absolute; top:0; left:0; width:100%; height:100%; z-index:6; pointer-events:none;
+        }
+        #smoke-container {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 11;
+            display: block; /* kept visible; canvas inside will manage visibility */
+            transform-origin: center center;
+        }
+        .smoke-particle {
+            position: absolute;
+            background-color: rgba(100, 100, 100, 0.6);
+            border-radius: 50%;
+            width: 15px;
+            height: 15px;
+            animation: smokeDrift 15s infinite linear;
+            opacity: 0;
+        }
+        @keyframes smokeDrift {
+            0% {
+                transform: translate(0, 0) scale(1);
+                opacity: 0.6;
+            }
+            100% {
+                transform: translate(30px, -150px) scale(1.2);
+                opacity: 0;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <canvas id="wakeCanvas"></canvas>
+    <div id="smoke-container"></div>
+    <div id="controls">
+        <div class="control-section">
+            <div class="section-title">Hastighet</div>
+            <input type="number" id="speed" value="0" step="0.01" />
+            <button onclick="changeSpeed(0.01)">Öka +0.01</button>
+            <button onclick="changeSpeed(-0.01)">Minska -0.01</button>
+        </div>
+        <div class="control-section">
+            <div class="section-title">Kurs</div>
+            <input type="number" id="heading" value="0" step="0.01" onchange="normalizeHeading()" />
+            <button onclick="changeHeading(0.01)">Höger →</button>
+            <button onclick="changeHeading(-0.01)">Vänster ←</button>
+        </div>
+        <div class="control-section">
+            <button onclick="startMoving()">Starta</button>
+            <button onclick="savePosition()">Spara Position</button>
+            <button onclick="loadPosition()">Ladda Position</button>
+            <button onclick="resetDistance()">Reset</button>
+            <div>Distans: <span id="distanceNM">00.00</span> NM</div>
+        </div>
+        <div class="control-section">
+            <div class="section-title">Zoom</div>
+            <button onclick="zoomIn()">Zoom In</button>
+            <button onclick="zoomOut()">Zoom Out</button>
+        </div>
+        <div class="control-section">
+            <div class="section-title">Måldestination</div>
+            Lat: <input type="number" id="destLat" value="55.6090" step="0.0001"><br>
+            Lon: <input type="number" id="destLon" value="12.9950" step="0.0001"><br>
+            <span>Återstår: <span id="remainingNM">--</span> NM</span><br>
+            <span>Beräknad ankomst: <span id="eta">--:--:--</span></span>
+        </div>
+        <div class="control-section">
+            <div class="section-title">Starttid för rutt</div>
+            <input type="time" id="startTime" value="">
+            <button onclick="scheduleRouteStart()">Schemalägg start</button>
+        </div>
+        <div class="control-section">
+            <button onclick="toggleWaypoints()">Visa/Dölj Waypoints</button>
+            <button onclick="saveRoute()">Spara Rutt (JSON)</button>
+            <input type="file" id="loadFile" onchange="loadRouteFromFile(event)" style="display:none" />
+            <button onclick="document.getElementById('loadFile').click()">Ladda Rutt</button>
+        </div>
+    </div>
+    <div id="speedDisplay">Hastighet: 0 knop</div>
+    <div id="isabella"></div>
+    <script>
+        mapboxgl.accessToken = 'pk.eyJ1IjoiZmVycnljaGF0IiwiYSI6ImNtOTJxejE4dzBib20ya3M1dGV5OGdvZHMifQ.mEolCyR3xF1vsWYK86Zwqw';
+        let position = [12.620325, 55.713123], speed = 0, heading = 0, displayedHeading = 0;
+        let sailingInterval, totalDistance = 0, lastPosition = [...position], savedZoom = 17;
+        let waypoints = [], waypointMarkers = [], waypointIndex = 0, autoNavigate = false, waypointsVisible = true;
+        const map = new mapboxgl.Map({container: 'map', style: 'mapbox://styles/mapbox/satellite-v9', center: position, zoom: savedZoom});
+        let cruiseship = document.getElementById('isabella');
+        map.on('zoom', () => adjustcruiseshipSize(map.getZoom()));
+        map.on('load', () => updateBoatPosition());
+
+        function updateBoatPosition() {
+            const point = map.project(position);
+            cruiseship.style.left = `${point.x - cruiseship.offsetWidth / 2}px`;
+            cruiseship.style.top = `${point.y - cruiseship.offsetHeight / 2}px`;
+        }
+
+        function adjustcruiseshipSize(zoomLevel) {
+            const scale = Math.pow(1.5, zoomLevel - 17) * 1.5;
+            cruiseship.style.width = `${350 * scale}px`;
+            cruiseship.style.height = `${350 * scale}px`;
+        }
+
+        function changeSpeed(delta) {
+            const input = document.getElementById('speed');
+            input.value = (parseFloat(input.value) + delta).toFixed(1);
+            speed = parseFloat(input.value);
+        }
+
+        function changeHeading(delta) {
+            const input = document.getElementById('heading');
+            let val = parseFloat(input.value) + delta;
+            if (val < 0) val += 360;
+            if (val >= 360) val -= 360;
+            input.value = val.toFixed(1);
+            heading = parseFloat(input.value);
+        }
+
+        function normalizeHeading() {
+            const input = document.getElementById('heading');
+            let val = parseFloat(input.value);
+            if (val < 0) val += 360;
+            if (val >= 360) val -= 360;
+            input.value = val.toFixed(1);
+            heading = parseFloat(input.value);
+        }
+
+        function resetDistance() {
+            totalDistance = 0;
+            document.getElementById("distanceNM").innerText = totalDistance.toFixed(2);
+        }
+
+        function savePosition() {
+            localStorage.setItem("savedBoatPosition", JSON.stringify({position: position, zoom: map.getZoom(), heading: heading}));
+        }
+
+        function loadPosition() {
+            const saved = JSON.parse(localStorage.getItem("savedBoatPosition"));
+            if (saved) {
+                position = saved.position;
+                savedZoom = saved.zoom;
+                heading = saved.heading || 0;
+                displayedHeading = heading;
+                cruiseship.style.transform = `rotate(${displayedHeading}deg)`;
+                document.getElementById('heading').value = heading.toFixed(1);
+                map.flyTo({center: position, zoom: savedZoom});
+                updateBoatPosition();
+            }
+        }
+
+        function haversine(coord1, coord2) {
+            const R = 6371e3;
+            const lat1 = coord1[1] * Math.PI / 180, lat2 = coord2[1] * Math.PI / 180;
+            const deltaLat = (coord2[1] - coord1[1]) * Math.PI / 180, deltaLon = (coord2[0] - coord1[0]) * Math.PI / 180;
+            const a = Math.sin(deltaLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(deltaLon / 2) ** 2;
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return (R * c) / 1852;
+        }
+
+        function zoomIn() { map.setZoom(map.getZoom() + 1); }
+        function zoomOut() { map.setZoom(map.getZoom() - 1); }
+
+        function updateRemainingDistanceAndETA() {
+            const destLat = parseFloat(document.getElementById('destLat').value);
+            const destLon = parseFloat(document.getElementById('destLon').value);
+            const distanceToDest = haversine(position, [destLon, destLat]);
+            document.getElementById('remainingNM').innerText = distanceToDest.toFixed(2);
+            if (speed > 0) {
+                const hours = distanceToDest / speed;
+                const etaDate = new Date(Date.now() + hours * 3600 * 1000);
+                const h = String(etaDate.getHours()).padStart(2, '0');
+                const m = String(etaDate.getMinutes()).padStart(2, '0');
+                const s = String(etaDate.getSeconds()).padStart(2, '0');
+                document.getElementById('eta').innerText = `${h}:${m}:${s}`;
+            } else {
+                document.getElementById('eta').innerText = '--:--:--';
+            }
+        }
+
+        map.on('click', (e) => {
+            let inputSpeed = prompt("Ange hastighet för denna waypoint (knop):", document.getElementById('speed').value);
+            inputSpeed = parseFloat(inputSpeed);
+            if (isNaN(inputSpeed)) inputSpeed = 0;
+            const coords = {lat: e.lngLat.lat, lon: e.lngLat.lng, speed: inputSpeed};
+            waypoints.push(coords);
+            const marker = new mapboxgl.Marker({color: 'red'}).setLngLat([coords.lon, coords.lat]).addTo(map);
+            waypointMarkers.push(marker);
+        });
+
+        function toggleWaypoints() {
+            waypointsVisible = !waypointsVisible;
+            waypointMarkers.forEach(m => { m.getElement().style.display = waypointsVisible ? 'block' : 'none'; });
+        }
+
+        function updateShipRotation() {
+            let delta = heading - displayedHeading;
+            if (delta > 180) delta -= 360;
+            if (delta < -180) delta += 360;
+            displayedHeading += Math.sign(delta) * Math.min(Math.abs(delta), 0.05);
+            displayedHeading = (displayedHeading + 360) % 360;
+            cruiseship.style.transform = `rotate(${displayedHeading}deg)`;
+        }
+
+        // ---------------- Realistisk Canvas-baserad Rök (ny) ----------------
+        (function() {
+            const container = document.getElementById('smoke-container');
+
+            // smoke canvas full viewport overlaid (inside container)
+            const smokeCanvas = document.createElement('canvas');
+            smokeCanvas.style.position = 'fixed';
+            smokeCanvas.style.left = '0';
+            smokeCanvas.style.top = '0';
+            smokeCanvas.style.width = '100%';
+            smokeCanvas.style.height = '100%';
+            smokeCanvas.style.pointerEvents = 'none';
+            smokeCanvas.style.zIndex = 11;
+            container.appendChild(smokeCanvas);
+            const sctx = smokeCanvas.getContext('2d');
+
+            function resizeSmoke() {
+                smokeCanvas.width = window.innerWidth;
+                smokeCanvas.height = window.innerHeight;
+            }
+            window.addEventListener('resize', resizeSmoke);
+            resizeSmoke();
+
+            // pre-render soft circular texture for smoke particle (radial gradient)
+            const tex = document.createElement('canvas');
+            const tsize = 128;
+            tex.width = tex.height = tsize;
+            const tctx = tex.getContext('2d');
+            const g = tctx.createRadialGradient(tsize/2, tsize/2, 1, tsize/2, tsize/2, tsize/2);
+            g.addColorStop(0, 'rgba(120,120,120,1)');
+            g.addColorStop(0.45, 'rgba(120,120,120,0.6)');
+            g.addColorStop(1, 'rgba(120,120,120,0)');
+            tctx.fillStyle = g;
+            tctx.fillRect(0,0,tsize,tsize);
+
+            const particles = [];
+            let lastTime = performance.now();
+
+            // spawn particles at chimney position (in screen coordinates)
+            function spawnParticlesAt(chimneyX, chimneyY, shipScale, shipSpeed) {
+                const baseCount = Math.max(1, Math.round(1 + shipSpeed * 0.1)); // Justera basräkningen för rökpartiklar
+                for (let i = 0; i < baseCount; i++) {
+                    const spread = (Math.PI / 180) * (8 + Math.random() * 12);
+                    const dir = (displayedHeading - 90 + 180) * Math.PI / 180; 
+                    const angle = dir + (Math.random() - 0.5) * spread;
+
+                    const speedFactor = 5 + Math.random() * 5 + shipSpeed * 1; // Justera hastighetsfaktorn
+                    const vx = Math.cos(angle) * speedFactor * shipScale + (Math.random() - 0.5) * 2;
+                    const vy = Math.sin(angle) * speedFactor * shipScale + (Math.random() - 0.5) * 2 - (1 + shipSpeed * 0.5); // Sänk den vertikala hastigheten
+
+                    const size = (3 + Math.random() * 5 + shipSpeed * 0.2) * shipScale; // Justera storleken på rökpartiklarna
+                    const ttl = 1.6 + Math.random() * 1.8 + shipSpeed * 0.01; // Justera livslängden
+                    particles.push({
+                        x: chimneyX + (Math.random() - 0.5) * 3 * shipScale,
+                        y: chimneyY + (Math.random() - 0.5) * 3 * shipScale,
+                        vx, vy,
+                        size,
+                        life: 0,
+                        ttl,
+                        rot: Math.random() * Math.PI * 2,
+                        drot: (Math.random() - 0.5) * 0.8,
+                        alpha: 0.3 * (0.5 + Math.random() * 0.5) // Justera alfa för att göra rök svagare
+                    });
+                }
+            }
+
+            function updateAndDraw(dt) {
+                sctx.clearRect(0, 0, smokeCanvas.width, smokeCanvas.height);
+
+                const ship = document.getElementById('isabella');
+                const shipRect = ship.getBoundingClientRect();
+                if (shipRect.width === 0 || shipRect.height === 0) {
+                    // draw nothing if ship not positioned yet
+                } else {
+                    const shipScale = (parseFloat(ship.style.width) || ship.offsetWidth) / 350;
+                    const centerX = shipRect.left + shipRect.width / 2;
+                    const centerY = shipRect.top + shipRect.height / 2;
+
+                    const rad = displayedHeading * Math.PI / 180;
+                    const forwardX = Math.sin(rad);
+                    const forwardY = -Math.cos(rad);
+
+                    const initialOffsetFromCenterPx = 90; // Ungefärligt pixeldistans från mitten till skorsten på akterdelen på en 350px bild.
+                    const additionalForwardPx = 15;       // Ytterligare 15 pixlar framåt från den punkten.
+
+                    const totalChimneyOffsetPx = (initialOffsetFromCenterPx - additionalForwardPx) * shipScale;
+
+                    const chimneyX = centerX - forwardX * totalChimneyOffsetPx;
+                    const chimneyY = centerY - forwardY * totalChimneyOffsetPx;
+
+                    if (speed > 0.01) {
+                        spawnParticlesAt(chimneyX, chimneyY, shipScale, speed);
+                        container.style.display = 'block';
+                    }
+
+                    const t = performance.now() / 1000;
+                    const windX = Math.sin(t * 0.45) * 6;
+                    const windY = Math.cos(t * 0.32) * 4;
+
+                    for (let i = particles.length - 1; i >= 0; i--) {
+                        const p = particles[i];
+                        const lifeNorm = p.life / p.ttl;
+                        const buoy = 1.5 * (1 - 0.2 * lifeNorm); 
+                        p.vy -= buoy * dt * (0.7 + Math.random() * 0.6);
+                        p.vx += (windX * (Math.random() - 0.5)) * dt * 4;
+                        p.vy += (windY * (Math.random() - 0.5)) * dt * 3;
+                        p.vx += (Math.random() - 0.5) * 6 * dt;
+                        p.vy += (Math.random() - 0.5) * 6 * dt;
+
+                        p.x += p.vx * dt;
+                        p.y += p.vy * dt;
+                        p.rot += p.drot * dt;
+                        p.life += dt;
+
+                        const fade = 1 - (p.life / p.ttl);
+                        const drawAlpha = Math.max(0, p.alpha * fade);
+                        const drawSize = p.size * (1 + 0.3 * (1 - fade)); 
+
+                        if (p.life >= p.ttl || drawAlpha <= 0.01 || p.y < -1000) {
+                            particles.splice(i, 1);
+                            continue;
+                        }
+
+                        sctx.save();
+                        sctx.globalCompositeOperation = 'source-over';
+                        sctx.globalAlpha = Math.min(1, drawAlpha);
+                        sctx.translate(p.x, p.y);
+                        sctx.rotate(p.rot);
+                        sctx.drawImage(tex, -drawSize / 2, -drawSize / 2, drawSize, drawSize);
+                        sctx.restore();
+                    }
+
+                    if (particles.length > 500) particles.splice(0, particles.length - 500);
+
+                    if (particles.length === 0 && speed <= 0.01) container.style.display = 'none';
+                }
+            }
+
+            function loop(now) {
+                const dt = Math.min(0.05, (now - lastTime) / 1000);
+                lastTime = now;
+                updateAndDraw(dt);
+                requestAnimationFrame(loop);
+            }
+            requestAnimationFrame(loop);
+
+            window.updateSmokePosition = function() {
+                if (smokeCanvas.width !== window.innerWidth || smokeCanvas.height !== window.innerHeight) resizeSmoke();
+            };
+        })();
+
+        // ---------------- Advanced Wake Water ----------------
+        (function() {
+            const canvas = document.getElementById('wakeCanvas'), ctx = canvas.getContext('2d');
+            let wakeTrail = [], lastSample = 0;
+            function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+            window.addEventListener('resize', () => { resize(); draw(); }); resize();
+            function forwardVec(rad) { return {x: Math.sin(rad), y: -Math.cos(rad)}; }
+            function sternLngLat() {
+                if (!map || !position || !cruiseship) return null;
+                const center = map.project(position);
+                const rad = (displayedHeading || 0) * Math.PI / 180;
+                const fwd = forwardVec(rad);
+                const boatLenPx = Math.max(cruiseship.offsetWidth || 100, cruiseship.offsetHeight || 100);
+                const sternOffset = boatLenPx * 0.32;
+                const sx = center.x - fwd.x * sternOffset;
+                const sy = center.y - fwd.y * sternOffset;
+                return map.unproject([sx, sy]);
+            }
+            function sampleTrail(now) {
+                if ((speed || 0) < 2) return;
+                const stern = sternLngLat();
+                if (!stern) return;
+                if (wakeTrail.length) {
+                    const last = wakeTrail[wakeTrail.length - 1];
+                    const a = map.project([last.lng, last.lat]);
+                    const b = map.project([stern.lng, stern.lat]);
+                    if (Math.hypot(b.x - a.x, b.y - a.y) > 250) { wakeTrail = []; }
+                }
+                wakeTrail.push({...stern, t: now});
+                const maxPts = Math.min(800, Math.max(60, Math.floor(speed * 35)));
+                if (wakeTrail.length > maxPts) wakeTrail.shift();
+            }
+            function buildWakePolygons(pts) {
+                const left = [], right = [], sideLeft = [], sideRight = [];
+                if (pts.length < 2) return {left, right, sideLeft, sideRight};
+                const w = cruiseship.offsetWidth, h = cruiseship.offsetHeight;
+                const boatLenPx = Math.max(w, h), zoomScale = Math.pow(2, map.getZoom() - 17);
+                const nearWidth = Math.max(3, boatLenPx * 0.045 * zoomScale);
+                const farWidth = Math.min(boatLenPx * 0.18 + speed * 0.8, boatLenPx * 0.30) * zoomScale;
+                const sideOffset = Math.max(3, boatLenPx * 0.03) * zoomScale;
+                for (let i = 0; i < pts.length; i++) {
+                    const p = pts[i]; let dx = 0, dy = 0;
+                    if (i < pts.length - 1) { dx = pts[i + 1].x - p.x; dy = pts[i + 1].y - p.y; }
+                    else { dx = p.x - pts[i - 1].x; dy = p.y - pts[i - 1].y; }
+                    const len = Math.hypot(dx, dy) || 1; const nx = -dy / len, ny = dx / len;
+                    const t = i / (pts.length - 1); const width = (farWidth * (1 - t) + nearWidth * t);
+                    const waveAmp = 0.25 * (1 - t);
+                    const wave = (Math.sin(Date.now() / 900 + i * 0.1) + Math.cos(Date.now() / 700 + i * 0.13)) * 0.5 * waveAmp;
+                    const swirlX = (Math.cos(Date.now() / 500 + i * 0.2) - 0.5) * 0.2;
+                    const swirlY = (Math.sin(Date.now() / 550 + i * 0.21) - 0.5) * 0.2;
+                    left.push({x: p.x + nx * (width + wave + swirlX), y: p.y + ny * (width + wave + swirlY)});
+                    right.push({x: p.x - nx * (width + wave + swirlX), y: p.y - ny * (width + wave + swirlY)});
+                    sideLeft.push({x: p.x + nx * (width + sideOffset + wave * 0.1), y: p.y + ny * (width + sideOffset + wave * 0.1)});
+                    sideRight.push({x: p.x - nx * (width + sideOffset + wave * 0.1), y: p.y - ny * (width + sideOffset + wave * 0.1)});
+                }
+                return {left, right, sideLeft, sideRight};
+            }
+            function draw() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                if (wakeTrail.length < 2) return;
+                const pts = wakeTrail.map(p => { const xy = map.project([p.lng, p.lat]); return {x: xy.x, y: xy.y}; });
+                const segs = buildWakePolygons(pts);
+                if (!segs.left.length || !segs.right.length) return;
+                ctx.beginPath(); ctx.moveTo(segs.left[0].x, segs.left[0].y);
+                for (let i = 1; i < segs.left.length; i++) ctx.lineTo(segs.left[i].x, segs.left[i].y);
+                for (let i = segs.right.length - 1; i >= 0; i--) ctx.lineTo(segs.right[i].x, segs.right[i].y);
+                ctx.closePath();
+                const grad = ctx.createLinearGradient(pts[pts.length - 1].x, pts[pts.length - 1].y, pts[0].x, pts[0].y);
+                grad.addColorStop(0.0, `rgba(205,225,255,${Math.min(0.28, 0.15 + speed * 0.012)})`);
+                grad.addColorStop(0.85, 'rgba(190,215,255,0.02)');
+                grad.addColorStop(1.0, 'rgba(180,210,255,0.0)');
+                ctx.fillStyle = grad; ctx.fill();
+                ctx.beginPath();
+                ctx.moveTo(segs.sideLeft[0].x, segs.sideLeft[0].y);
+                for (let i = 1; i < segs.sideLeft.length; i++) ctx.lineTo(segs.sideLeft[i].x, segs.sideLeft[i].y);
+                for (let i = segs.sideRight.length - 1; i >= 0; i--) ctx.lineTo(segs.sideRight[i].x, segs.sideRight[i].y);
+                ctx.closePath();
+                const gradSide = ctx.createLinearGradient(pts[pts.length - 1].x, pts[pts.length - 1].y, pts[0].x, pts[0].y);
+                gradSide.addColorStop(0.0, 'rgba(205,225,255,0.04)');
+                gradSide.addColorStop(0.85, 'rgba(190,215,255,0.01)');
+                gradSide.addColorStop(1.0, 'rgba(180,210,255,0.0)');
+                ctx.fillStyle = gradSide; ctx.fill();
+            }
+            function animate(now) {
+                if (!lastSample || now - lastSample >= 100) {
+                    if (speed >= 2) sampleTrail(now);
+                    else if (wakeTrail.length) wakeTrail.shift();
+                    lastSample = now;
+                }
+                draw();
+                requestAnimationFrame(animate);
+                updateSmokePosition();
+            }
+            map.on('move', draw);
+            map.on('zoom', draw);
+            map.on('resize', () => { resize(); draw(); });
+            requestAnimationFrame(animate);
+            window.addEventListener('resize', () => { resize(); draw(); });
+        })();
+
+        // ---------------- Start Moving ----------------
+        function startMoving() {
+            if (sailingInterval) clearInterval(sailingInterval);
+            autoNavigate = waypoints.length > 0;
+            sailingInterval = setInterval(() => {
+                if (autoNavigate && waypointIndex < waypoints.length) {
+                    const target = waypoints[waypointIndex];
+                    speed = target.speed;
+                    document.getElementById('speed').value = speed.toFixed(1);
+                    const dx = (target.lon - position[0]) * Math.cos(position[1] * Math.PI / 180);
+                    const dy = target.lat - position[1];
+                    const desiredHeading = (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
+                    let currentHeading = heading;
+                    let delta = desiredHeading - currentHeading;
+                    if (delta > 180) delta -= 360;
+                    if (delta < -180) delta += 360;
+                    currentHeading += delta * 0.05;
+                    heading = (currentHeading + 360) % 360;
+                    document.getElementById('heading').value = heading.toFixed(1);
+                    const distToTarget = haversine(position, [target.lon, target.lat]);
+                    if (distToTarget < 0.02) { waypointIndex++; if (waypointIndex >= waypoints.length) autoNavigate = false; }
+                }
+                const distancePerSecond = speed / 3600 / 10, R = 6371e3, latRad = position[1] * Math.PI / 180, lonRad = position[0] * Math.PI / 180;
+                const brng = heading * Math.PI / 180, d = distancePerSecond * 1852;
+                const newLat = Math.asin(Math.sin(latRad) * Math.cos(d / R) + Math.cos(latRad) * Math.sin(d / R) * Math.cos(brng));
+                const newLon = lonRad + Math.atan2(Math.sin(brng) * Math.sin(d / R) * Math.cos(latRad), Math.cos(d / R) - Math.sin(latRad) * Math.sin(newLat));
+                position[1] = newLat * 180 / Math.PI; position[0] = newLon * 180 / Math.PI;
+                const distNM = haversine(lastPosition, position); totalDistance += Math.abs(distNM); lastPosition = [...position];
+                document.getElementById("distanceNM").innerText = totalDistance.toFixed(2);
+                map.flyTo({center: position, zoom: map.getZoom(), speed: 0.5, essential: true});
+                document.getElementById('speedDisplay').innerText = `Hastighet: ${speed.toFixed(1)} knop`;
+                updateShipRotation(); updateBoatPosition(); updateRemainingDistanceAndETA();
+            }, 100);
+        }
+
+        // ---------------- Route Start ----------------
+        function scheduleRouteStart() {
+            const startTimeInput = document.getElementById('startTime').value;
+            if (!startTimeInput) return;
+            const [hours, minutes] = startTimeInput.split(':').map(Number);
+            const now = new Date();
+            const startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hours, minutes, 0, 0);
+            let delay = startDate - now;
+            if (delay < 0) delay = 0;
+            setTimeout(() => { startMoving(); }, delay);
+        }
+
+        // ---------------- Save/Load Route ----------------
+        function saveRoute() {
+            const json = JSON.stringify(waypoints);
+            const blob = new Blob([json], {type: "application/json"});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'rutt.json';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+        function loadRouteFromFile(event) {
+            const file = event.target.files[0];
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const data = JSON.parse(e.target.result);
+                waypoints = data;
+                waypointMarkers.forEach(m => m.remove());
+                waypointMarkers.length = 0;
+                waypointIndex = 0;
+                autoNavigate = waypoints.length > 0;
+                if (waypoints.length > 0) {
+                    position = [waypoints[0].lon, waypoints[0].lat];
+                    lastPosition = [...position];
+                    if (waypoints.length > 1) {
+                        const target = waypoints[1];
+                        const dx = (target.lon - position[0]) * Math.cos(position[1] * Math.PI / 180);
+                        const dy = target.lat - position[1];
+                        heading = (Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360;
+                    } else heading = 0;
+                    displayedHeading = heading;
+                    cruiseship.style.transform = `rotate(${displayedHeading}deg)`;
+                    map.flyTo({center: position, zoom: map.getZoom()});
+                }
+            };
+            reader.readAsText(file);
+        }
+    </script>
+</body>
+</html>
+
